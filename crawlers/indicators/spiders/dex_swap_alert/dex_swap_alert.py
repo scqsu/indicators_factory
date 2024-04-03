@@ -5,17 +5,35 @@ from crawlers.utils import SpiderBase, rds
 from jinja2 import Template
 from crawlers.utils.group_alarm import catch_except
 from crawlers.utils.humanize import humanize_float_en
+from crawlers.utils.headers import common_headers
 
 class DexSwapAlert(SpiderBase):
-    name = 'dex_swap_alert'
+    name = 'idx-dex-swap-tracker'
 
     binance_symbol_list = {}
-
     binance_url = 'https://api.binance.com/api/v3/ticker/price'
+
+    uniswap_v3_thegraph_chains = {
+        "Ethereum": "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
+        "Polygon": "https://api.thegraph.com/subgraphs/name/ianlapham/uniswap-v3-polygon",
+        "Optimism": "https://api.thegraph.com/subgraphs/name/ianlapham/optimism-post-regenesis",
+        "Arbitrum": "https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal",
+        "Celo": "https://api.thegraph.com/subgraphs/name/jesse-sawa/uniswap-celo",
+        "BNB Chain": "https://api.thegraph.com/subgraphs/name/ianlapham/uniswap-v3-bsc"
+    }
+
+    chains_scan_url = {
+        "Ethereum": "https://etherscan.io/tx/%s",
+        "Polygon": "https://polygonscan.com/tx/%s",
+        "Optimism": "https://optimistic.etherscan.io/tx/%s",
+        "Arbitrum": "https://arbiscan.io/tx/%s",
+        "Celo": "https://celoscan.io/tx/%s",
+        "BNB Chain": "https://bscscan.com/tx/%s"
+    }
 
     uniswap_v3 = {
                     "project_name": 'uniswap_v3',
-                    "query_url":'https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3',
+                    "query_url_dict": uniswap_v3_thegraph_chains,
                     "query_latest_block": '''
                                             {
                                                 swaps(
@@ -25,7 +43,7 @@ class DexSwapAlert(SpiderBase):
                                                     where: {timestamp_gt: "%s"}
                                                 ) {
                                                     transaction {
-                                                        blockNumber
+                                                    blockNumber
                                                     }
                                                 }
                                             }''' % int(time.time()-600), # Subtract 600 seconds to ensure that the block is already confirm
@@ -38,6 +56,7 @@ class DexSwapAlert(SpiderBase):
                                                     blockNumber_lte: "%s"
                                                 }
                                             }
+                                            first: 1000
                                             orderBy: logIndex
                                             orderDirection: asc
                                         ) {
@@ -68,16 +87,24 @@ class DexSwapAlert(SpiderBase):
                 self.binance_symbol_list[symbol['symbol']] = symbol['price']
         
         self.binance_symbol_list['WETH'] = self.binance_symbol_list['ETH']
+        self.binance_symbol_list['cbETH'] = self.binance_symbol_list['ETH']
         self.binance_symbol_list['WBTC'] = self.binance_symbol_list['BTC']
-
+        self.binance_symbol_list['USDT'] = 1.0
+        # 一些异常交易对的白名单
+        self.binance_symbol_list['POLY'] = 0
+        self.binance_symbol_list['BTT'] = 0
 
     @catch_except
     def start_requests(self):
-        resp = requests.get(self.binance_url)
+        resp = requests.get(self.binance_url, headers=common_headers)
         self.parse_binance_symbol(json.loads(resp.text)) # 获取行情数据
 
         for dex in self.dex_projects :
-            yield scrapy.Request(url=dex['query_url'], method='POST', 
+            query_dict = dex['query_url_dict']
+            for chain, url in query_dict.items():
+                dex['chain'] = chain
+                dex['query_url'] = url
+                yield scrapy.Request(url=url, method='POST', 
                                 body=json.dumps({"query": dex['query_latest_block']}),
                                 callback=self.parse_blockNum,
                                 cb_kwargs=dex)
@@ -86,24 +113,26 @@ class DexSwapAlert(SpiderBase):
     @catch_except
     def parse_blockNum(self, response, **dex): # 获取最新 blockNum，结合本地存储 blockNum，不断获取新数据
         current_blockNum = response.json()['data']['swaps'][0]['transaction']['blockNumber']
-        # pre_blockNum = rds.get(f"{self.name}:{dex['project_name']}:blockNum")
-        # rds.set(f"{self.name}:{dex['project_name']}:blockNum", current_blockNum, 60 * 60)
+        # # pre_blockNum = '16772669' #rds.getex(self.name + dex['project_name'], 'blockNum')
+        pre_blockNum = rds.get(f"{self.name}:{dex['project_name']}:{dex['chain']}:blockNum")
+        rds.set(f"{self.name}:{dex['project_name']}:{dex['chain']}:blockNum", current_blockNum, 60 * 60)
 
-        pre_blockNum = 16814041
-        current_blockNum = 16814042
+        # pre_blockNum = 16815569
+        # current_blockNum = 16815574
 
         if not pre_blockNum:
             return
-        
-        print(f"开始爬取 {pre_blockNum}  -  {current_blockNum} 之间的 swap 数据")
+
+        print(f"开始爬取 {dex['chain']} {dex['project_name']} {pre_blockNum}  -  {current_blockNum} 之间的 swap 数据")
 
         yield scrapy.Request(url=dex['query_url'], method='POST',
                             body=json.dumps({
                                 "query": dex['query_swaps'] % (pre_blockNum, current_blockNum)
                             }),
+                            headers=common_headers,
                             callback=self.parse_swaps,
-                            cb_kwargs={"project_name": dex['project_name']})
-
+                            cb_kwargs={"project_name": dex['project_name'],
+                                       "chain": dex['chain']})
 
     @catch_except
     def parse_swaps(self, response, **dex): # 解析 swaps 数据
@@ -116,7 +145,7 @@ class DexSwapAlert(SpiderBase):
         for swap in swaps :
             # 根据币种类型，处理交易 type，分为：alt_coin_trade 和
             trade_type = 'alt_coin_trade'
-            mainstream_coin = ('WBTC', 'WETH', 'USDT', 'USDC', 'DAI', 'BUSD')
+            mainstream_coin = ('WBTC', 'WETH', 'USDT', 'USDC', 'DAI', 'BUSD', "GUSD", "PAX", "cbETH", "USDD", "LUSD", "wstETH", "rETH", "frxETH", "boxETH")
             if (swap['token0']['symbol'] in mainstream_coin) and (swap['token1']['symbol'] in mainstream_coin):
                 trade_type = 'mainstream_coin_trade'
 
@@ -150,24 +179,24 @@ class DexSwapAlert(SpiderBase):
                     'amount1': swap['amount1'],
                     'sender': swap['origin'],
                     'project_name': dex['project_name'],
+                    'chain': dex['chain'],
                     'trade_type': trade_type,
                     'blockNumber': swap['transaction']['blockNumber']
                 }
             
-                filter_tag = swap['transaction']['blockNumber'] + '_' + swap['origin'] # 把同一个 blockNumber 里面，同一个 sender 执行了多笔交易的情况标记出来。这种不会是手动操作，肯定是调用了特殊合约 或者 批量发起
-                
-                if filter_tag in swap_filter_dic.keys() : # 增加一个过滤的 dic
-                    swap_filter_dic[filter_tag] += 1
-                else :
-                    swap_filter_dic[filter_tag] = 0
+            filter_tag = swap['transaction']['blockNumber'] + '_' + swap['origin'] # 把同一个 blockNumber 里面，同一个 sender 执行了多笔交易的情况标记出来。这种不会是手动操作，肯定是调用了特殊合约 或者 批量发起
+            
+            if filter_tag in swap_filter_dic.keys() : # 增加一个过滤的 dic
+                swap_filter_dic[filter_tag] += 1
+            else :
+                swap_filter_dic[filter_tag] = 0
 
         # swap 处理好之后，计算每个 swap 的 value
-        for tx_id in swap_dic.keys() :
+        for tx_id in list(swap_dic.keys()):
             
             filter_tag = swap_dic[tx_id]['blockNumber'] + '_' + swap_dic[tx_id]['sender']
             if swap_filter_dic[filter_tag] > 0 : # 如果是同一个 block 多笔的情况，进行过滤
-                print("过滤："+tx_id)
-                swap_dic[tx_id] = 'pass_swap'
+                swap_dic.pop(tx_id)
                 continue
 
             if swap_dic[tx_id]['symbol0'] in self.binance_symbol_list:
@@ -183,19 +212,16 @@ class DexSwapAlert(SpiderBase):
                 swap_dic[tx_id]['value1'] = 0
 
 
-            if swap_dic[tx_id]['value1'] > 0 and swap_dic[tx_id]['value0'] > 0 : # 如果两个 symbol 都有价值，则取最小值作为过滤条件
-                swap_dic[tx_id]['value'] = round(abs(swap_dic[tx_id]['value1']) if abs(swap_dic[tx_id]['value1']) < abs(swap_dic[tx_id]['value0']) else abs(swap_dic[tx_id]['value0']), 2)
+            if abs(swap_dic[tx_id]['value1']) > 0 and abs(swap_dic[tx_id]['value0']) > 0 : # 如果两个 symbol 都有价值，则取最小值作为过滤条件
+                swap_dic[tx_id]['value'] = round(min(abs(swap_dic[tx_id]['value1']), abs(swap_dic[tx_id]['value0'])), 2)
             else : # 如果不是两个 value 都有价值，则取大值做过滤条件
-                swap_dic[tx_id]['value'] = round(abs(swap_dic[tx_id]['value1']) if abs(swap_dic[tx_id]['value1']) > abs(swap_dic[tx_id]['value0']) else abs(swap_dic[tx_id]['value0']), 2)
+                swap_dic[tx_id]['value'] = round(max(abs(swap_dic[tx_id]['value1']), abs(swap_dic[tx_id]['value0'])), 2)
 
         self.alert_process(swap_dic)
 
 
     def alert_process(self, swap_dic) :
         for tx_id, swap in swap_dic.items():
-            if swap == 'pass_swap' :
-                continue
-
             swap['tx_id'] = tx_id
             # 交易 symbo，0 为买入 1 为卖出
             if float(swap['amount0']) > 0 :
@@ -215,25 +241,21 @@ class DexSwapAlert(SpiderBase):
                 swap['amount0'] = abs(float(swap['amount0']))
                 swap['amount1'] = float(swap['amount1'])
 
+            swap['symbol'] = f"${swap['symbol1']} swap_to ${swap['symbol0']}"
+
+            tx_url = self.chains_scan_url[swap['chain']] % swap["tx_id"]
+
             # 根据交易类型做过滤
-            if swap['trade_type'] == 'mainstream_coin_trade' and swap['value'] >= 2000000:  # 3000000
+            if swap['trade_type'] == 'mainstream_coin_trade' and swap['value'] >= 10000000:  # 10000000
                 self.foramt_swap(swap)
-                # Tools.multilingual_information_flow_push(tmp_name='DEX_SWAP_TRACKER', params= swap, origin_url=f'https://etherscan.io/tx/{swap["tx_id"]}')
 
                 print(Template(self.alert_en_template()).render(swap))
                 print(Template(self.alert_cn_template()).render(swap))
-
-                if swap['value'] >= 10000000 :
-                    print('---- Global Notification ----')
-            elif swap['trade_type'] == 'alt_coin_trade' and swap['value'] >= 200000: #300000
+            elif swap['trade_type'] == 'alt_coin_trade' and swap['value'] >= 150000: #500000
                 self.foramt_swap(swap)
-                # Tools.multilingual_information_flow_push(tmp_name='DEX_SWAP_TRACKER', params= swap, origin_url=f'https://etherscan.io/tx/{swap["tx_id"]}')
 
                 print(Template(self.alert_en_template()).render(swap))
                 print(Template(self.alert_cn_template()).render(swap))
-
-                if swap['value'] >= 1000000 :
-                    print('---- Global Notification ----')
 
     def foramt_swap(self, params):
         params['origin_value0'] = abs(params.get('value0') or 0)
@@ -244,20 +266,23 @@ class DexSwapAlert(SpiderBase):
         params['amount1'] = humanize_float_en(float(params['amount1']))
         params['value1'] = humanize_float_en(abs(float(params.get('value1') or 0)))
         params['symbol1_price'] = round(float(params.get('symbol1_price') or 0), 2) if params.get('symbol1_price') else None
+        params['account_tag'] = self.get_address_tags(params['sender'])
         return params;
 
     def alert_en_template(self):
         return '''
 According to KingData monitoring, {{amount1}} {{symbol1}}{% if origin_value1 > 1 %}(${{value1}}){% endif %} has just been swaped into {{amount0}} {{symbol0}}{% if origin_value0 > 1 %}(${{value0}}){% endif %}.
 Sell/Quantity/Price: {{symbol1}} ｜ {{amount1}} | {% if symbol1_price %}${{symbol1_price}}{% else %}-{% endif %}
-Buy/Quantity/Price: {{symbol0}} ｜ {{amount0}} | {% if symbol0_price %}${{symbol0_price}}{% else %}-{% endif %}
-Account: {{sender}}
-        '''
+Buy/Quantity/Price: {{symbol0}} ｜ {{amount0}} | {% if symbol0_price %}${{symbol0_price}}{% else %}-{% endif %}{% if account_tag.show_tag %}
+TradeUser：{{account_tag.show_tag}}{% if account_tag.twitter %} (Twitter: @{{account_tag.twitter}}){% endif %}{% endif %}
+Address: {{sender}}
+'''
     
     def alert_cn_template(self):
         return '''
 据 KingData 监控，刚刚 {{amount1}} {{symbol1}}{% if origin_value1 > 1 %}(${{value1}}){% endif %} 兑换成 {{amount0}} {{symbol0}}{% if origin_value0 > 1 %}(${{value0}}){% endif %}。
 卖出币种/数量/价格：{{symbol1}} ｜ {{amount1}} | {% if symbol1_price %}${{symbol1_price}}{% else %}-{% endif %}
-买入币种/数量/价格：{{symbol0}} ｜ {{amount0}} | {% if symbol0_price %}${{symbol0_price}}{% else %}-{% endif %}
-交易用户：{{sender}}
-        '''
+买入币种/数量/价格：{{symbol0}} ｜ {{amount0}} | {% if symbol0_price %}${{symbol0_price}}{% else %}-{% endif %}{% if account_tag.show_tag %}
+用户：{{account_tag.show_tag}}{% if account_tag.twitter %} (Twitter: @{{account_tag.twitter}}){% endif %}{% endif %}
+地址: {{sender}}
+ '''
