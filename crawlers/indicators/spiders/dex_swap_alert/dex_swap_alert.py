@@ -145,8 +145,7 @@ class DexSwapAlert(SpiderBase):
         for swap in swaps :
             # 根据币种类型，处理交易 type，分为：alt_coin_trade 和
             trade_type = 'alt_coin_trade'
-            mainstream_coin = ('WBTC', 'WETH', 'USDT', 'USDC', 'DAI', 'BUSD', "GUSD", "PAX", "cbETH", "USDD", "LUSD", "wstETH", "rETH", "frxETH", "boxETH")
-            if (swap['token0']['symbol'] in mainstream_coin) and (swap['token1']['symbol'] in mainstream_coin):
+            if self.is_main_stream_token(swap['token0']['symbol']) and self.is_main_stream_token(swap['token1']['symbol']):
                 trade_type = 'mainstream_coin_trade'
 
             # dex 里面到代币，名称没有换回来
@@ -219,6 +218,17 @@ class DexSwapAlert(SpiderBase):
 
         self.alert_process(swap_dic)
 
+
+    def is_main_stream_token(self, token_name):
+        keywords = ['usd', 'btc', 'eth', 'pax']
+        
+        lowercase_tokenname = token_name.lower()
+        
+        for keyword in keywords:
+            if keyword in lowercase_tokenname:
+                return True
+        
+        return False
 
     def alert_process(self, swap_dic) :
         for tx_id, swap in swap_dic.items():
